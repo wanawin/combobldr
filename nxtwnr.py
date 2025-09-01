@@ -1,236 +1,242 @@
-# app.py
-# Pick-5 Winner Profiler (Profile-Based) with Profile Picker (16 profiles)
-# Choose State + Mid/Eve profile JSON, paste last 7 seeds, and get per-position probabilities,
-# inclusion, parity/low-high/sum distributions, and Top 20 straights.
+# boxes_beststraights_app.py
+# DC-5 Box Generator + Best Straight Picker
+# Adds a simple toggle + input for "Do NOT use these digits" so those digits are never generated.
 
 from __future__ import annotations
 import json
-import os
-import numpy as np
+import re
+from itertools import combinations_with_replacement, permutations
+from collections import Counter
 import streamlit as st
 
-st.set_page_config(page_title="Pick-5 Winner Profiler (Profile Picker)", layout="wide")
-st.title("Pick-5 Winner Profiler (Profile-Based)")
-st.caption("Choose a learned profile (State + Mid/Eve), paste your last 7 seeds (oldest first, most recent last).")
+st.set_page_config(page_title="DC-5: Constrained Boxes → Best Straight(s)", layout="wide")
+st.title("DC-5: Constrained Boxes → Best Straight(s)")
 
-BEST_LOOKBACK = 7
-LOW_MAX = 4  # low digits 0..4
+LOW_MAX_DEFAULT = 4
+EPS = 1e-15
+FIVE_DIGIT_RE = re.compile(r'(\d)[^\d]*?(\d)[^\d]*?(\d)[^\d]*?(\d)[^\d]*?(\d)')
 
-STATES = ["OH", "DC", "FL", "GA", "PA", "LA", "VA", "DE"]
-DRAWS  = ["mid", "eve"]  # lower-case
+def parse_digit_list(s: str) -> list[int]:
+    out = []
+    for token in (s or "").replace(",", " ").split():
+        if token.isdigit():
+            d = int(token)
+            if 0 <= d <= 9: out.append(d)
+    seen, res = set(), []
+    for d in out:
+        if d not in seen:
+            seen.add(d); res.append(d)
+    return res
 
-# ---------- File loader (FIXED) ----------
-def load_positional_matrices_for(state: str, draw: str):
-    """
-    Load the learned positional matrices for the selected State + Draw.
-    - Tries 'positional_matrices_<STATE>_<draw>.json'
-    - For DC+mid, also tries legacy 'positional_matrices.json' for backward compatibility
-    Returns (mats, path) where mats is the dict {'P1':..., 'P5':...}.
-    """
-    fname = f"positional_matrices_{state}_{draw}.json"
-    search = [fname]
-    if state == "DC" and draw == "mid":
-        search.insert(0, "positional_matrices.json")
+def longest_consecutive_run_length(uniq_sorted: list[int]) -> int:
+    if not uniq_sorted: return 0
+    run = best = 1
+    for i in range(1, len(uniq_sorted)):
+        if uniq_sorted[i] == uniq_sorted[i-1] + 1:
+            run += 1; best = max(best, run)
+        else:
+            run = 1
+    return best
 
-    for path in search:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                mats = json.load(f)
-            # sanity check
-            for key in ("P1", "P2", "P3", "P4", "P5"):
-                if key not in mats:
-                    raise ValueError(f"{path} is missing key '{key}'.")
-                for row in mats[key]:
-                    s = sum(row)
-                    if not (99.0 <= s <= 101.0):  # allow tiny float drift
-                        raise ValueError(f"{path}: a row in {key} sums to {s:.3f}, expected ~100.")
-            return mats, path
+def violates_patterns(counts: Counter, allow_quints, allow_quads, allow_triples, allow_double_doubles):
+    vals = list(counts.values())
+    if not allow_quints and any(v == 5 for v in vals): return True
+    if not allow_quads  and any(v == 4 for v in vals): return True
+    if not allow_triples and any(v == 3 for v in vals): return True
+    pairs = sum(1 for v in vals if v == 2)
+    if not allow_double_doubles and pairs >= 2: return True
+    return False
 
-    tried = ", ".join(search)
-    raise FileNotFoundError(
-        "No profile file found for "
-        f"{state} {draw.upper()}.\n"
-        f"Tried: {tried}.\n"
-        "Create it with your build_profile.py and save using the filename pattern "
-        "'positional_matrices_<STATE>_<mid|eve>.json' (e.g., positional_matrices_FL_eve.json)."
-    )
+def normalize_row(row):
+    s = sum(row)
+    if 99.5 <= s <= 100.5: return [x/100.0 for x in row]  # %
+    if 0.99  <= s <= 1.01: return row                     # prob
+    return [x/s for x in row] if s > 0 else row
 
-# ---------- Helpers ----------
-def parse_seeds(text: str) -> list[list[int]]:
-    seeds = []
-    for ln in text.strip().splitlines():
-        s = ln.strip()
-        if s.isdigit() and len(s) == 5:
-            seeds.append([int(c) for c in s])
-        elif s:
-            raise ValueError(f"Invalid seed line '{s}'. Use exactly 5 digits, no dashes.")
-    return seeds
-
-def avg_positional_preds(seeds: list[list[int]], mats_pct: dict[str, list[list[float]]]) -> dict[int, np.ndarray]:
-    """
-    Average per-position distributions across the last BEST_LOOKBACK seeds
-    using the learned conditional rows (percentages -> probabilities).
-    """
-    preds: dict[int, np.ndarray] = {}
-    for pos in range(1, 6):
-        mat = np.array(mats_pct[f"P{pos}"], dtype=float) / 100.0  # 10x10
-        acc = np.zeros(10, dtype=float)
-        for s in seeds:
-            acc += mat[s[pos-1]]
-        acc /= max(1, len(seeds))
-        preds[pos] = acc
-    return preds
-
-def digit_inclusion_probs(preds: dict[int, np.ndarray]) -> np.ndarray:
-    not_in = np.ones(10, dtype=float)
-    for pos in range(1, 6):
-        not_in *= (1.0 - preds[pos])  # prob digit d NOT used at this position
-    return 1.0 - not_in
-
-def poisson_binomial_probs(p_list: list[float]) -> np.ndarray:
-    n = len(p_list)
-    dp = np.zeros(n+1, dtype=float)
-    dp[0] = 1.0
-    for p in p_list:
-        ndp = np.zeros(n+1, dtype=float)
-        for k in range(n+1):
-            ndp[k] += dp[k] * (1.0 - p)
-            if k+1 <= n:
-                ndp[k+1] += dp[k] * p
-        dp = ndp
-    return dp
-
-def sum_distribution_from_positions(preds: dict[int, np.ndarray]) -> np.ndarray:
-    pmf = np.array([1.0])
-    for pos in range(1, 6):
-        v = preds[pos]
-        pos_vec = np.zeros(46, dtype=float)
-        for d in range(10):
-            pos_vec[d] = v[d]
-        pmf = np.convolve(pmf, pos_vec)[:46]
-    return pmf
-
-def topN_combos(preds: dict[int, np.ndarray], K_per_pos: int = 5, N: int = 20) -> list[tuple[str, float]]:
-    idxs = [list(np.argsort(preds[pos])[::-1][:K_per_pos]) for pos in range(1, 6)]
-    cand: list[tuple[str, float]] = []
-    for d1 in idxs[0]:
-        for d2 in idxs[1]:
-            for d3 in idxs[2]:
-                for d4 in idxs[3]:
-                    for d5 in idxs[4]:
-                        p = preds[1][d1]*preds[2][d2]*preds[3][d3]*preds[4][d4]*preds[5][d5]
-                        cand.append(("".join(map(str, [d1,d2,d3,d4,d5])), p))
-    cand.sort(key=lambda x: x[1], reverse=True)
-    return cand[:N]
-
-def pct(x: float) -> str:
-    return f"{x*100:.2f}%"
-
-# ---------- Sidebar: profile picker ----------
-with st.sidebar:
-    st.subheader("Profile")
-    state = st.selectbox("State", STATES, index=STATES.index("DC"))
-    draw  = st.selectbox("Draw", DRAWS, index=0)  # default mid
-    st.caption("Profiles are JSON files named: positional_matrices_<STATE>_<mid|eve>.json")
-    uploaded = st.file_uploader("Or load a profile JSON (override this session)", type=["json"])
-
-# Load profile
-mats_pct = None
-src_info = ""
-if uploaded is not None:
+def parse_positional_stats(text: str) -> dict[int, list[float]]:
+    text = (text or "").strip()
+    if not text: return {}
     try:
-        mats_pct = json.load(uploaded)
-        for key in ("P1","P2","P3","P4","P5"):
-            if key not in mats_pct:
-                st.error("Uploaded JSON missing key: " + key)
-                st.stop()
-        src_info = "(from upload)"
-    except Exception as e:
-        st.error(f"Could not parse uploaded JSON: {e}")
-        st.stop()
-else:
-    try:
-        mats_pct, used_path = load_positional_matrices_for(state, draw)
-        src_info = f"(loaded: {used_path})"
-    except Exception as e:
-        st.error(str(e))
-        st.stop()
+        obj = json.loads(text)
+        out = {}
+        for k in ("p1","p2","p3","p4","p5"):
+            row = [float(obj[k].get(str(d), 0.0)) for d in range(10)]
+            out[int(k[1])] = normalize_row(row)
+        return out
+    except Exception:
+        pass
+    out = {}
+    segments = [seg.strip() for seg in text.split(";") if seg.strip()]
+    for seg in segments:
+        if ":" not in seg: continue
+        head, tail = seg.split(":", 1)
+        head = head.strip().lower()
+        if not (len(head)==2 and head[0]=="p" and head[1] in "12345"): continue
+        pos = int(head[1]); row = [0.0]*10
+        for chunk in tail.split(","):
+            chunk = chunk.strip()
+            if not chunk: continue
+            if ":" in chunk:
+                d_str, v_str = [x.strip() for x in chunk.split(":", 1)]
+            else:
+                parts = chunk.split()
+                if len(parts)!=2: continue
+                d_str, v_str = parts
+            if d_str.isdigit():
+                d = int(d_str)
+                if 0<=d<=9:
+                    try: v = float(v_str.replace("%",""))
+                    except: v = 0.0
+                    row[d] = v
+        out[pos] = normalize_row(row)
+    if len(out)!=5: raise ValueError("Provide p1..p5 positional rows.")
+    return out
 
-st.success(f"Profile selected: **{state} {draw.upper()}** {src_info}")
+def straight_score(straight, pos_probs: dict[int, list[float]]) -> float:
+    score = 1.0
+    for i, d in enumerate(straight, start=1):
+        score *= pos_probs.get(i, [0.0]*10)[d]
+    return score
 
-# ---------- Seeds input ----------
-st.subheader("Enter the last 7 seeds (oldest first, most recent last)")
-seed_text = st.text_area(
-    "One per line, 5 digits each",
-    height=150,
-    placeholder="e.g.\n42150\n36788\n72556\n76244\n10936\n62511\n42003"
-)
-go = st.button("Analyze")
+# Sidebar
+st.sidebar.header("Constraints")
+sum_min, sum_max = st.sidebar.slider("Sum range", 0, 45, (0, 45))
+low_max = st.sidebar.number_input("Low max digit (low ≤ this value)", 0, 9, LOW_MAX_DEFAULT, 1)
+
+mand_str = st.sidebar.text_input("Mandatory digits (OR logic: at least one must appear)",
+                                 help="Comma/space-separated digits, e.g. 7, 0, 2")
+mand_digits = parse_digit_list(mand_str)
+
+enable_forbid = st.sidebar.checkbox("Enable 'Do NOT use digits' filter", value=False)
+forbid_str = st.sidebar.text_input("Digits to exclude (never generate)", value="", disabled=not enable_forbid,
+                                   help="Comma/space-separated digits to exclude entirely, e.g. 8, 9")
+forbid_digits = set(parse_digit_list(forbid_str)) if enable_forbid else set()
+
+c1, c2 = st.sidebar.columns(2)
+even_exact = c1.number_input("# Even (leave -1 to ignore)", -1, 5, -1, 1)
+odd_exact  = c2.number_input("# Odd (leave -1 to ignore)",  -1, 5, -1, 1)
+c3, c4 = st.sidebar.columns(2)
+low_exact  = c3.number_input("# Low (0..low_max) (leave -1 to ignore)", -1, 5, -1, 1)
+high_exact = c4.number_input("# High (leave -1 to ignore)", -1, 5, -1, 1)
+
+st.sidebar.markdown("**Pattern allowances** (check to allow; uncheck to filter out):")
+allow_quints = st.sidebar.checkbox("Allow quints (aaaaa)", value=False)
+allow_quads  = st.sidebar.checkbox("Allow quads  (aaaab)", value=False)
+allow_triples= st.sidebar.checkbox("Allow triples (aaabc)", value=True)
+allow_dd     = st.sidebar.checkbox("Allow double doubles (aabbc)", value=True)
+allow_runs4p = st.sidebar.checkbox("Allow runs ≥4 (e.g., 1-2-3-4)", value=False)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Positional stats (optional, to pick best straight)**")
+st.sidebar.caption("JSON p1..p5 or shorthand; values as % or prob.")
+pos_stats_text = st.sidebar.text_area("Positional stats", height=160, value="")
+
+go = st.sidebar.button("Generate")
 
 if not go:
+    st.info("Set your constraints and click **Generate**.")
     st.stop()
 
-# Parse seeds
-try:
-    seeds_all = parse_seeds(seed_text)
-except ValueError as e:
-    st.error(str(e))
-    st.stop()
+# parse positional stats (optional)
+pos_probs = {}
+if pos_stats_text.strip():
+    try:
+        pos_probs = parse_positional_stats(pos_stats_text)
+        for i in range(1,6):
+            if not any(pos_probs[i]):
+                st.warning(f"Positional row p{i} sums to zero — all straights score 0 at position {i}.")
+    except Exception as e:
+        st.warning(f"Couldn't parse positional stats — proceeding without scoring straights.\nDetails: {e}")
+        pos_probs = {}
 
-if len(seeds_all) < BEST_LOOKBACK:
-    st.warning(f"You provided {len(seeds_all)} seed(s). For best results, paste **{BEST_LOOKBACK}**.")
-seeds = seeds_all[-BEST_LOOKBACK:]  # use last up to 7
+# generate boxes
+total = 0
+kept = []
+for comb in combinations_with_replacement(range(10), 5):
+    total += 1
 
-# ---------- Compute predictions ----------
-preds = avg_positional_preds(seeds, mats_pct)
-incl = digit_inclusion_probs(preds)
+    # up-front forbidden digits: never generate
+    if forbid_digits and any(d in forbid_digits for d in comb):
+        continue
 
-p_odd = [float(np.sum(preds[pos][1::2])) for pos in range(1,6)]
-p_low = [float(np.sum(preds[pos][:LOW_MAX+1])) for pos in range(1,6)]
-odd_dist = poisson_binomial_probs(p_odd)
-low_dist = poisson_binomial_probs(p_low)
+    s = sum(comb)
+    if not (sum_min <= s <= sum_max):
+        continue
 
-SUM_BANDS = [(0,10),(11,15),(16,20),(21,25),(26,30),(31,35),(36,40),(41,45)]
-sum_pmf = sum_distribution_from_positions(preds)
-sum_band_pct = [(f"{lo}-{hi}", float(np.sum(sum_pmf[lo:hi+1]))) for (lo,hi) in SUM_BANDS]
+    counts = Counter(comb)
 
-top20 = topN_combos(preds, K_per_pos=5, N=20)
+    # parity
+    evens = sum(1 for d in comb if d % 2 == 0)
+    odds  = 5 - evens
+    if even_exact >= 0 and evens != even_exact: continue
+    if odd_exact  >= 0 and odds  != odd_exact:  continue
 
-# ---------- Display ----------
-c1, c2 = st.columns([2,1])
-with c1:
-    st.markdown("### Place-Value Digit Probabilities (next winner)")
-    tabs = st.tabs([f"P{pos}" for pos in range(1,6)])
-    for pos, tab in zip(range(1,6), tabs):
-        with tab:
-            order = np.argsort(preds[pos])[::-1]
-            st.write(", ".join([f"{d}: {pct(preds[pos][d])}" for d in order[:10]]))
-with c2:
-    st.markdown("### Digit Inclusion (any position)")
-    order = np.argsort(incl)[::-1]
-    st.write(", ".join([f"{d}: {pct(incl[d])}" for d in order]))
+    # low/high
+    lows  = sum(1 for d in comb if d <= low_max)
+    highs = 5 - lows
+    if low_exact  >= 0 and lows  != low_exact:  continue
+    if high_exact >= 0 and highs != high_exact: continue
 
-st.markdown("---")
-c3, c4, c5 = st.columns(3)
-with c3:
-    st.markdown("### Parity (odd-count)")
-    st.write(", ".join([f"{k} odds: {pct(odd_dist[k])}" for k in range(6)]))
-with c4:
-    st.markdown(f"### Low/High (Low ≤ {LOW_MAX})")
-    st.write(", ".join([f"{k} lows: {pct(low_dist[k])}" for k in range(6)]))
-with c5:
-    st.markdown("### Sum ranges")
-    st.write(", ".join([f"{band}: {pct(p)}" for band, p in sum_band_pct]))
+    # mandatory OR
+    if mand_digits and not any(d in counts for d in mand_digits): continue
 
-st.markdown("---")
-st.markdown("### Top 20 full 5-digit candidates (by product of per-position probabilities)")
-for combo, p in top20:
-    st.write(f"**{combo}** — weight {pct(p)}")
+    # patterns
+    if violates_patterns(counts, allow_quints, allow_quads, allow_triples, allow_dd): continue
 
-st.markdown("---")
-st.markdown("**Notes**")
-st.write("- This app uses the picked **State/Draw** profile file and does not re-learn weekly.")
-st.write("- To refresh a profile, rebuild its JSON with `build_profile.py` and save it as "
-         "`positional_matrices_<STATE>_<mid|eve>.json` in this folder "
-         "(e.g., `positional_matrices_FL_eve.json`).")
-st.write("- DC Mid also works with your legacy `positional_matrices.json` filename.")
+    # runs constraint
+    if not allow_runs4p:
+        uniq_sorted = sorted(set(comb))
+        if longest_consecutive_run_length(uniq_sorted) >= 4: continue
+
+    kept.append(comb)
+
+st.success(f"Found {len(kept)} box combos (out of {total} total).")
+
+# pick best straight(s) per your tie rule
+if pos_probs:
+    outputs = []
+    notes = []
+    for box in kept:
+        best, best_perms = -1.0, []
+        for perm in set(permutations(box)):
+            sc = straight_score(perm, pos_probs)
+            if sc > best + EPS:
+                best, best_perms = sc, [perm]
+            elif abs(sc - best) <= EPS:
+                best_perms.append(perm)
+
+        if best <= 0.0 + EPS:
+            outputs.append(("".join(map(str, box)), best))
+            if len(best_perms) > 1:
+                notes.append(f"{''.join(map(str, box))}: suppressed {len(best_perms)-1} equal 0-score ties")
+            continue
+
+        pos_vals = [set() for _ in range(5)]
+        for p in best_perms:
+            for i, d in enumerate(p):
+                pos_vals[i].add(d)
+        multi_positions = [i for i,s in enumerate(pos_vals) if len(s)>1]
+        if len(multi_positions)==1 and len(pos_vals[multi_positions[0]])==2:
+            idx = multi_positions[0]
+            variants = {}
+            for p in best_perms:
+                key = p[idx]
+                if key not in variants:
+                    variants[key] = p
+                if len(variants)==2: break
+            for p in variants.values():
+                outputs.append(("".join(map(str, p)), best))
+        else:
+            best_one = min(("".join(map(str, p)) for p in best_perms))
+            outputs.append((best_one, best))
+            if len(best_perms)>1:
+                notes.append(f"{''.join(map(str, box))}: suppressed {len(best_perms)-1} equivalent ties")
+
+    outputs.sort(key=lambda x: (-x[1], x[0]))
+    st.markdown("### Best Straight(s) per Box")
+    st.code("\n".join(s for s,_ in outputs))
+    if notes:
+        st.info("Tie reductions:\n" + "\n".join(notes))
+else:
+    st.markdown("### Boxes (no positional stats provided)")
+    st.code("\n".join("".join(map(str, b)) for b in kept))
