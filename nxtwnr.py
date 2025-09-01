@@ -1,7 +1,7 @@
 # app.py
-# DC-5 / Pick-5 Winner Profiler (Profile-Based) with Profile Picker (16 profiles)
-# Paste your last 7 seeds; choose State + Mid/Eve to load the right learned profile JSON.
-# Profile JSON format: {'P1': [[...10], ...10], ..., 'P5': [[...10], ...10]} with rows summing ~100.
+# Pick-5 Winner Profiler (Profile-Based) with Profile Picker (16 profiles)
+# Choose State + Mid/Eve profile JSON, paste last 7 seeds, and get per-position probabilities,
+# inclusion, parity/low-high/sum distributions, and Top 20 straights.
 
 from __future__ import annotations
 import json
@@ -16,31 +16,28 @@ st.caption("Choose a learned profile (State + Mid/Eve), paste your last 7 seeds 
 BEST_LOOKBACK = 7
 LOW_MAX = 4  # low digits 0..4
 
-STATES = ["OH","DC","FL","GA","PA","LA","VA","DE"]
-DRAWS  = ["mid","eve"]  # exactly these lowercase strings
+STATES = ["OH", "DC", "FL", "GA", "PA", "LA", "VA", "DE"]
+DRAWS  = ["mid", "eve"]  # lower-case
 
-def load_positional_matrices_for(state: str, draw: str) -> dict[str, list[list[float]]]:
+# ---------- File loader (FIXED) ----------
+def load_positional_matrices_for(state: str, draw: str):
     """
     Load the learned positional matrices for the selected State + Draw.
     - Tries 'positional_matrices_<STATE>_<draw>.json'
     - For DC+mid, also tries legacy 'positional_matrices.json' for backward compatibility
-    Returns dict {'P1': [10 rows], ..., 'P5': [10 rows]} with row sums ~100.
-    Raises FileNotFoundError with a helpful message if missing.
+    Returns (mats, path) where mats is the dict {'P1':..., 'P5':...}.
     """
-    # primary name
     fname = f"positional_matrices_{state}_{draw}.json"
     search = [fname]
-    # backward compat: DC mid can come from positional_matrices.json
     if state == "DC" and draw == "mid":
         search.insert(0, "positional_matrices.json")
 
-    last_err = None
     for path in search:
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
                 mats = json.load(f)
             # sanity check
-            for key in ("P1","P2","P3","P4","P5"):
+            for key in ("P1", "P2", "P3", "P4", "P5"):
                 if key not in mats:
                     raise ValueError(f"{path} is missing key '{key}'.")
                 for row in mats[key]:
@@ -48,13 +45,17 @@ def load_positional_matrices_for(state: str, draw: str) -> dict[str, list[list[f
                     if not (99.0 <= s <= 101.0):  # allow tiny float drift
                         raise ValueError(f"{path}: a row in {key} sums to {s:.3f}, expected ~100.")
             return mats, path
-        last_err = path
+
+    tried = ", ".join(search)
     raise FileNotFoundError(
-        f"No profile file found for {state} {draw.upper()}.\n"
-        f"Tried: {', '.join(search)}.\n"
-        f> "Create it with your build_profile.py and save using that filename pattern."
+        "No profile file found for "
+        f"{state} {draw.upper()}.\n"
+        f"Tried: {tried}.\n"
+        "Create it with your build_profile.py and save using the filename pattern "
+        "'positional_matrices_<STATE>_<mid|eve>.json' (e.g., positional_matrices_FL_eve.json)."
     )
 
+# ---------- Helpers ----------
 def parse_seeds(text: str) -> list[list[int]]:
     seeds = []
     for ln in text.strip().splitlines():
@@ -68,8 +69,7 @@ def parse_seeds(text: str) -> list[list[int]]:
 def avg_positional_preds(seeds: list[list[int]], mats_pct: dict[str, list[list[float]]]) -> dict[int, np.ndarray]:
     """
     Average per-position distributions across the last BEST_LOOKBACK seeds
-    using the learned conditional rows.
-    mats_pct entries are percentages; convert to probabilities before averaging.
+    using the learned conditional rows (percentages -> probabilities).
     """
     preds: dict[int, np.ndarray] = {}
     for pos in range(1, 6):
@@ -126,22 +126,20 @@ def topN_combos(preds: dict[int, np.ndarray], K_per_pos: int = 5, N: int = 20) -
 def pct(x: float) -> str:
     return f"{x*100:.2f}%"
 
-# ---------------- UI: profile picker ----------------
+# ---------- Sidebar: profile picker ----------
 with st.sidebar:
     st.subheader("Profile")
-    state = st.selectbox("State", STATES, index=STATES.index("DC") if "DC" in STATES else 0)
+    state = st.selectbox("State", STATES, index=STATES.index("DC"))
     draw  = st.selectbox("Draw", DRAWS, index=0)  # default mid
-    st.caption("Profiles are JSON files named: positional_matrices_<STATE>_<mid/eve>.json")
-    # Optional: upload a one-off profile JSON (overrides file on disk)
-    uploaded = st.file_uploader("Or load a profile JSON (override just for this session)", type=["json"])
+    st.caption("Profiles are JSON files named: positional_matrices_<STATE>_<mid|eve>.json")
+    uploaded = st.file_uploader("Or load a profile JSON (override this session)", type=["json"])
 
-# Try to load profile
+# Load profile
 mats_pct = None
 src_info = ""
 if uploaded is not None:
     try:
         mats_pct = json.load(uploaded)
-        # sanity check
         for key in ("P1","P2","P3","P4","P5"):
             if key not in mats_pct:
                 st.error("Uploaded JSON missing key: " + key)
@@ -160,9 +158,13 @@ else:
 
 st.success(f"Profile selected: **{state} {draw.upper()}** {src_info}")
 
-# ---------------- UI: seeds input ----------------
+# ---------- Seeds input ----------
 st.subheader("Enter the last 7 seeds (oldest first, most recent last)")
-seed_text = st.text_area("One per line, 5 digits each", height=150, placeholder="e.g.\n42150\n36788\n72556\n76244\n10936\n62511\n42003")
+seed_text = st.text_area(
+    "One per line, 5 digits each",
+    height=150,
+    placeholder="e.g.\n42150\n36788\n72556\n76244\n10936\n62511\n42003"
+)
 go = st.button("Analyze")
 
 if not go:
@@ -179,7 +181,7 @@ if len(seeds_all) < BEST_LOOKBACK:
     st.warning(f"You provided {len(seeds_all)} seed(s). For best results, paste **{BEST_LOOKBACK}**.")
 seeds = seeds_all[-BEST_LOOKBACK:]  # use last up to 7
 
-# Compute predictions
+# ---------- Compute predictions ----------
 preds = avg_positional_preds(seeds, mats_pct)
 incl = digit_inclusion_probs(preds)
 
@@ -188,15 +190,13 @@ p_low = [float(np.sum(preds[pos][:LOW_MAX+1])) for pos in range(1,6)]
 odd_dist = poisson_binomial_probs(p_odd)
 low_dist = poisson_binomial_probs(p_low)
 
-# Simple sum bands (same as before)
 SUM_BANDS = [(0,10),(11,15),(16,20),(21,25),(26,30),(31,35),(36,40),(41,45)]
 sum_pmf = sum_distribution_from_positions(preds)
 sum_band_pct = [(f"{lo}-{hi}", float(np.sum(sum_pmf[lo:hi+1]))) for (lo,hi) in SUM_BANDS]
 
-# Top 20
 top20 = topN_combos(preds, K_per_pos=5, N=20)
 
-# ---------------- Display ----------------
+# ---------- Display ----------
 c1, c2 = st.columns([2,1])
 with c1:
     st.markdown("### Place-Value Digit Probabilities (next winner)")
@@ -227,10 +227,10 @@ st.markdown("### Top 20 full 5-digit candidates (by product of per-position prob
 for combo, p in top20:
     st.write(f"**{combo}** — weight {pct(p)}")
 
-# Context/notes
 st.markdown("---")
 st.markdown("**Notes**")
-st.write("- This app doesn’t re-learn weekly; it uses the picked **State/Draw** profile file.")
-st.write("- To refresh a profile, rebuild its JSON with your `build_profile.py` and save it as "
-         f"`positional_matrices_<STATE>_<{'|'.join(DRAWS)}>.json` in this folder (e.g., `positional_matrices_FL_eve.json`).")
-st.write("- DC Mid still works with your legacy `positional_matrices.json` filename.")
+st.write("- This app uses the picked **State/Draw** profile file and does not re-learn weekly.")
+st.write("- To refresh a profile, rebuild its JSON with `build_profile.py` and save it as "
+         "`positional_matrices_<STATE>_<mid|eve>.json` in this folder "
+         "(e.g., `positional_matrices_FL_eve.json`).")
+st.write("- DC Mid also works with your legacy `positional_matrices.json` filename.")
