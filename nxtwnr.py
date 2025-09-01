@@ -1,11 +1,11 @@
 # app.py
-# Pick-5 Winner Profiler (Profile-Based) with Profile Picker (16 profiles)
-# Choose State + Mid/Eve profile JSON, paste last 7 seeds, and get per-position probabilities,
-# inclusion, parity/low-high/sum distributions, and Top 20 straights.
+# Pick-5 Winner Profiler (Profile Picker) — now with a "Copy/Paste Positional Profile" block
+# So you can paste p1..p5 directly into the straight-maker app (JSON or shorthand), plus a JSON download.
 
 from __future__ import annotations
 import json
 import os
+import io
 import numpy as np
 import streamlit as st
 
@@ -19,7 +19,7 @@ LOW_MAX = 4  # low digits 0..4
 STATES = ["OH", "DC", "FL", "GA", "PA", "LA", "VA", "DE"]
 DRAWS  = ["mid", "eve"]  # lower-case
 
-# ---------- File loader (FIXED) ----------
+# ---------- File loader ----------
 def load_positional_matrices_for(state: str, draw: str):
     """
     Load the learned positional matrices for the selected State + Draw.
@@ -126,6 +126,27 @@ def topN_combos(preds: dict[int, np.ndarray], K_per_pos: int = 5, N: int = 20) -
 def pct(x: float) -> str:
     return f"{x*100:.2f}%"
 
+def preds_to_json(preds: dict[int, np.ndarray]) -> str:
+    """Build JSON with p1..p5, digits 0..9 as percentage values (0–100)."""
+    out = {}
+    for pos in range(1, 6):
+        row = {str(d): float(preds[pos][d] * 100.0) for d in range(10)}
+        out[f"p{pos}"] = row
+    return json.dumps(out, indent=2)
+
+def preds_to_shorthand(preds: dict[int, np.ndarray]) -> str:
+    """
+    Build shorthand like:
+    p1: 4:28.57, 7:28.57, 0:28.57, 2:14.29, ...
+    Ordered by descending prob; includes all digits 0..9.
+    """
+    lines = []
+    for pos in range(1, 6):
+        order = np.argsort(preds[pos])[::-1]
+        parts = [f"{d}:{preds[pos][d]*100:.2f}" for d in order]
+        lines.append(f"p{pos}: " + ", ".join(parts))
+    return "; ".join(lines)
+
 # ---------- Sidebar: profile picker ----------
 with st.sidebar:
     st.subheader("Profile")
@@ -196,7 +217,7 @@ sum_band_pct = [(f"{lo}-{hi}", float(np.sum(sum_pmf[lo:hi+1]))) for (lo,hi) in S
 
 top20 = topN_combos(preds, K_per_pos=5, N=20)
 
-# ---------- Display ----------
+# ---------- Display: analytics ----------
 c1, c2 = st.columns([2,1])
 with c1:
     st.markdown("### Place-Value Digit Probabilities (next winner)")
@@ -226,6 +247,31 @@ st.markdown("---")
 st.markdown("### Top 20 full 5-digit candidates (by product of per-position probabilities)")
 for combo, p in top20:
     st.write(f"**{combo}** — weight {pct(p)}")
+
+# ---------- NEW: Copy/Paste Positional Profile (for Straight Maker) ----------
+st.markdown("---")
+st.markdown("## Copy/Paste Positional Profile (for Straight Maker)")
+st.caption("Use either format below in your straight-maker app’s 'Positional stats' field.")
+
+# JSON format (digits 0..9 as percents, per p1..p5)
+json_blob = preds_to_json(preds)
+st.markdown("**JSON format**")
+st.code(json_blob, language="json")
+
+# Shorthand format (sorted by descending prob; includes all digits)
+short_blob = preds_to_shorthand(preds)
+st.markdown("**Shorthand format**")
+st.code(short_blob)
+
+# Download JSON
+buf = io.StringIO()
+buf.write(json_blob)
+st.download_button(
+    label="Download p1..p5 profile (.json)",
+    data=buf.getvalue(),
+    file_name=f"positional_profile_{state}_{draw}.json",
+    mime="application/json"
+)
 
 st.markdown("---")
 st.markdown("**Notes**")
